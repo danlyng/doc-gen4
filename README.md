@@ -50,11 +50,11 @@ open the generated html files in your browser.  You need to serve them from a pr
 it to work. An easy way to do that is to run `python3 -m http.server` from the `docbuild/.lake/build/doc`
 directory.
 
-## SQLite backend on Lean 4.28
+## SQLite documentation backend
 
-This branch backports the SQLite documentation backend to Lean 4.28.0. Documentation analysis writes to `.lake/build/api-docs.db`, and HTML generation reads from that database. The existing `:docs` facets run both phases.
+This fork includes the SQLite documentation backend. Documentation analysis writes to `.lake/build/api-docs.db`, and HTML generation reads from that database. The existing `:docs` facets run both phases.
 
-To populate the database without generating HTML, use the `:docInfo` facet, for example with Mathlib 4.28:
+To populate the database without generating HTML, use the `:docInfo` facet, for example with Mathlib:
 
 ```sh
 lake build Mathlib:docInfo
@@ -66,7 +66,7 @@ To generate HTML from the populated database later:
 lake exe doc-gen4 fromDb .lake/build/api-docs.db
 ```
 
-The SQLite library is pinned to a revision compatible with Lean 4.28. Keep that pin when updating dependencies.
+Each release tag uses its matching Lean toolchain and dependency revisions.
 
 ## Batch analysis
 
