@@ -24,8 +24,7 @@ require Cli from git
   "https://github.com/leanprover/lean4-cli" @ "main"
 
 require leansqlite from git
-  -- Pin the pre-4.29 API used by this Lean 4.28 backport.
-  "https://github.com/leanprover/leansqlite" @ "2765af4d645eb7a482f6555ac4e5cf9fb69e1ab1"
+  "https://github.com/david-christiansen/leansqlite" @ "main"
 
 /--
 Obtains the subdirectory of the Lean package relative to the root of the enclosing git repository.
