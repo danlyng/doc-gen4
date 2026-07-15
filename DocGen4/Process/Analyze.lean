@@ -118,7 +118,7 @@ def order (l r : ModuleMember) : Bool :=
   else
     Position.lt lp rp
 
-def getDocString : ModuleMember → Option (String ⊕ VersoDocString)
+def getDocString : ModuleMember → Option (String ⊕ (VersoDocString × String))
 | docInfo i => i.getDocString
 | modDoc i => some (.inl i.doc)
 
