@@ -19,7 +19,29 @@ def runSingleCmd (p : Parsed) : IO UInt32 := do
   let relevantModules := #[p.positionalArg! "module" |>.as! String |> String.toName]
   let sourceUri := p.positionalArg! "sourceUri" |>.as! String
   let doc ← load <| .analyzeConcreteModules relevantModules
-  updateModuleDb builtinDocstringValues doc buildDir dbFile (some sourceUri)
+  updateModuleDb builtinDocstringValues doc buildDir dbFile (fun _ => some sourceUri)
+  return 0
+
+/-- Reconstruct the source URL of a module from the library's base source URI, matching the
+per-module URI computed by Lake's `srcUri` facet (`<libBaseUri>/<module/path>.lean`). -/
+def mkModuleSourceUrl (libBaseUri : String) (mod : Name) : String :=
+  mod.components.foldl (init := libBaseUri) (fun acc c => acc.push '/' ++ c.toString (escape := false)) ++ ".lean"
+
+def runBatchCmd (p : Parsed) : IO UInt32 := do
+  IO.println "-*- Running in Batch Mode -*-"
+  let buildDir := match p.flag? "build" with
+    | some dir => dir.as! String
+    | none => ".lake/build"
+  let dbFile := p.positionalArg! "db" |>.as! String
+  let libBaseUri := p.positionalArg! "sourceUri" |>.as! String
+  let modulesFile := p.positionalArg! "modules" |>.as! String
+  let modules := (← IO.FS.readFile modulesFile).split (· == '\n')
+    |>.filterMap (fun s => let s := s.trimAscii.toString; if s.isEmpty then none else some s.toName)
+    |>.toArray
+  -- Import the whole library's closure once and document all of it in this single process,
+  -- fanning the analysis out across worker threads.
+  let doc ← load (.analyzeConcreteModules modules) (parallel := true)
+  updateModuleDb builtinDocstringValues doc buildDir dbFile (fun m => some (mkModuleSourceUrl libBaseUri m))
   return 0
 
 def runGenCoreCmd (p : Parsed) : IO UInt32 := do
@@ -29,7 +51,7 @@ def runGenCoreCmd (p : Parsed) : IO UInt32 := do
   let dbFile := p.positionalArg! "db" |>.as! String
   let module := p.positionalArg! "module" |>.as! String |> String.toName
   let doc ← load <| .analyzePrefixModules module
-  updateModuleDb builtinDocstringValues doc buildDir dbFile none
+  updateModuleDb builtinDocstringValues doc buildDir dbFile (fun _ => none)
   return 0
 
 def runDocGenCmd (_p : Parsed) : IO UInt32 := do
@@ -81,6 +103,17 @@ def runFromDbCmd (p : Parsed) : IO UInt32 := do
   let dbPath := p.positionalArg! "db" |>.as! String
   let manifestOutput? := (p.flag? "manifest").map (·.as! String)
   let moduleRoots := (p.variableArgsAs! String).map String.toName
+  -- Comma-separated list of module-name prefixes whose stale modules should be pruned. Empty/absent
+  -- disables pruning entirely (back-compat for direct `fromDb` invocations).
+  let prunePrefixes : Array Name := match p.flag? "prune-prefix" with
+    | some f => ((f.as! String).splitOn ",").toArray.filterMap fun s =>
+        let s := s.trimAscii.toString
+        if s.isEmpty then none else some s.toName
+    | none => #[]
+
+  -- Prune stale modules before reading anything else, so the loaded linking context and the
+  -- generated HTML reflect the pruned state.
+  pruneStaleModules dbPath prunePrefixes moduleRoots builtinDocstringValues
 
   -- Flush WAL so the database file is self-contained for concurrent readers
   walCheckpoint dbPath
@@ -158,6 +191,20 @@ def singleCmd := `[Cli|
     sourceUri : String; "The sourceUri as computed by the Lake facet"
 ]
 
+def batchCmd := `[Cli|
+  batch VIA runBatchCmd;
+  "Populate the database with documentation for an entire library in a single process. Imports the \
+   library's transitive closure once and analyzes all listed modules in parallel."
+
+  FLAGS:
+    b, build : String; "Build directory."
+
+  ARGS:
+    db : String; "Path to the SQLite database (relative to build dir)"
+    sourceUri : String; "The library's base sourceUri as computed by the Lake facet"
+    modules : String; "Path to a file listing the library's module names, one per line"
+]
+
 def genCoreCmd := `[Cli|
   genCore VIA runGenCoreCmd;
   "Populate the database with documentation for the specified Lean core module (Init, Std, Lake, Lean)."
@@ -199,8 +246,9 @@ def fromDbCmd := `[Cli|
   "Generate HTML documentation from a SQLite database."
 
   FLAGS:
-    b, build : String; "Build directory (default: .lake/build)"
-    m, manifest : String; "Manifest output file, listing all generated HTML files."
+    b, build : String;        "Build directory (default: .lake/build)"
+    m, manifest : String;     "Manifest output file, listing all generated HTML files."
+    "prune-prefix" : String;  "Comma-separated list of module-name prefixes; rows under one of these prefixes that are not reachable from the given roots are deleted from the database."
 
   ARGS:
     db : String; "Path to the SQLite database"
@@ -208,11 +256,12 @@ def fromDbCmd := `[Cli|
 ]
 
 def docGenCmd : Cmd := `[Cli|
-  "doc-gen4" VIA runDocGenCmd; ["0.2.0"]
+  "doc-gen4" VIA runDocGenCmd; ["0.3.0"]
   "A documentation generator for Lean 4."
 
   SUBCOMMANDS:
     singleCmd;
+    batchCmd;
     genCoreCmd;
     bibPrepassCmd;
     headerDataCmd;

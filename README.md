@@ -68,6 +68,20 @@ lake exe doc-gen4 fromDb .lake/build/api-docs.db
 
 The SQLite library is pinned to a revision compatible with Lean 4.28. Keep that pin when updating dependencies.
 
+## Batch analysis
+
+Set `DOCGEN_BATCH` to enable whole-library analysis in a single process when building library or package `:docs` targets:
+
+```sh
+env DOCGEN_BATCH=1 DOCGEN_NUM_THREADS=8 lake build Mathlib:docs
+```
+
+Batch mode imports each library once and analyzes declarations across worker threads, then generates equations serially. `DOCGEN_NUM_THREADS` controls the worker count; by default, doc-gen4 uses the online processor count, falling back to eight workers if detection fails. Any change to a library causes its entire batch to be analyzed again. Unset `DOCGEN_BATCH` to use the per-module analyzer; module `:docs` and ordinary `:docInfo` targets always use that analyzer.
+
+For database-only batch analysis, run `lake build Mathlib:docInfoBatch`. This facet returns a marker file; documentation data still goes into `.lake/build/api-docs.db`.
+
+Library and package `:docs` builds also prune database entries under their library and core prefixes when the modules are no longer reachable from the configured roots. Single-module builds and database-only analysis do not prune.
+
 ## Requirements to run `doc-gen4`
 In order to compile itself `doc-gen4` requires:
 - a Lean 4 or `elan` installation

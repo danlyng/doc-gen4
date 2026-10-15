@@ -207,9 +207,8 @@ def coreTarget (component : Lean.Name) : FetchM (Job FilePath) := do
   let buildDir := (← getRootPackage).buildDir
   -- Building the core targets adds their information to the database file. While it would be
   -- possible to hash just the relevant content of the database (e.g. using SQLite's SHA3 module)
-  -- and write the result to a file, this adds a significant overhead. Instead, we create an empty
-  -- "marker file" to indicate that the database content has been inserted, and rely on its trace
-  -- changing to trigger rebuilds.
+  -- and write the result to a file, this adds a significant overhead. Instead, we write a timestamp
+  -- to a marker file so its content hash propagates actual rebuilds to downstream targets.
   let markerFile := buildDir / "doc-data" / s!"core-{component}.doc"
   bibPrepassJob.bindM fun _ => do
     exeJob.mapM fun exeFile => do
@@ -220,7 +219,10 @@ def coreTarget (component : Lean.Name) : FetchM (Job FilePath) := do
           env := ← getAugmentedEnv
         }
         createParentDirs markerFile
-        IO.FS.writeFile markerFile ""
+        -- See the note on the equivalent write in `module_facet docInfo` below: writing a fresh
+        -- timestamp (rather than an empty string) makes the marker's content hash change on every
+        -- actual rebuild, so downstream `docs` targets re-run instead of being replayed.
+        IO.FS.writeFile markerFile (toString (← IO.monoNanosNow))
       return markerFile
 
 /--
@@ -251,9 +253,8 @@ module_facet docInfo (mod) : FilePath := do
   -- Building the documentation info for the module adds or updates the relevant content in the
   -- database. If the dependencies change, then this needs to be re-done. While it would be possible
   -- to hash just the relevant content of the database (e.g. using SQLite's SHA3 module) and write
-  -- the result to a file, this adds a significant overhead. Instead, we create an empty "marker
-  -- file" to indicate that the database content has been inserted, and rely on its Lake trace
-  -- changing to trigger rebuilds.
+  -- the result to a file, this adds a significant overhead. Instead, we write a timestamp to a marker
+  -- file so its content hash propagates actual rebuilds to downstream targets.
   let markerFile := buildDir / "doc-data" / s!"{mod.name}.doc"
   coreJob.bindM fun _ => do
     depDocJobs.bindM fun _ => do
@@ -269,7 +270,12 @@ module_facet docInfo (mod) : FilePath := do
                 env := ← getAugmentedEnv
               }
               createParentDirs markerFile
-              IO.FS.writeFile markerFile ""
+              -- Write a timestamp instead of an empty string so that downstream targets (e.g. the
+              -- per-library/-package `docs` facet) see a fresh content hash whenever this action
+              -- actually runs. With an empty marker, Lake propagates the unchanged content hash to
+              -- downstream targets and they're replayed instead of rebuilt, which means `fromDb`
+              -- never re-runs when a module's source changes — and stale rows are never pruned.
+              IO.FS.writeFile markerFile (toString (← IO.monoNanosNow))
             return markerFile
 
 /--
@@ -278,6 +284,45 @@ Populates the database with information for all modules in a library.
 library_facet docInfo (lib) : Array FilePath := do
   let mods ← (← lib.modules.fetch).await
   pure <| Job.collectArray <| ← mods.mapM (fetch <| ·.facet `docInfo)
+
+/--
+Like `docInfo`, but populates the database for the *entire* library in a single `doc-gen4 batch`
+process: the library's transitive closure is imported once and all of its modules are analyzed in
+parallel. This is much faster for from-scratch builds than the per-module `docInfo` facet (which
+re-imports the closure once per module), at the cost of coarser incrementality — editing any module
+re-analyzes the whole library. Opt in by setting `DOCGEN_BATCH=1` (see the `docs` facets).
+
+Returns a single marker file recording that the database was populated for this library.
+-/
+library_facet docInfoBatch (lib) : FilePath := do
+  let exeJob ← «doc-gen4».fetch
+  let bibPrepassJob ← bibPrepass.fetch
+  let coreJob ← coreDocs.fetch
+  let mods ← (← lib.modules.fetch).await
+  -- All of the library's oleans must exist before we import the closure.
+  let artsJob := Job.mixArray <| ← mods.mapM (·.leanArts.fetch)
+  let libUriJob ← fetch <| lib.facet `srcUri
+  let buildDir := (← getRootPackage).buildDir
+  let markerFile := buildDir / "doc-data" / s!"{lib.name}--library.docInfoBatch.doc"
+  let modulesFile := buildDir / "doc-data" / s!"{lib.name}--library.modules.txt"
+  coreJob.bindM fun _ => do
+    artsJob.bindM fun _ => do
+      bibPrepassJob.bindM fun _ => do
+        libUriJob.bindM fun libUri => do
+          exeJob.mapM fun exeFile => do
+            buildFileUnlessUpToDate' markerFile do
+              createParentDirs modulesFile
+              IO.FS.writeFile modulesFile (String.intercalate "\n" (mods.toList.map (·.name.toString)))
+              proc {
+                cmd := exeFile.toString
+                args := #["batch", "--build", buildDir.toString, "api-docs.db", libUri, modulesFile.toString]
+                env := ← getAugmentedEnv
+              }
+              createParentDirs markerFile
+              -- Timestamp (not empty) so downstream `fromDb` re-runs whenever analysis re-runs; see
+              -- the note on the per-module `docInfo` marker write.
+              IO.FS.writeFile markerFile (toString (← IO.monoNanosNow))
+            return markerFile
 
 /--
 A facet to collect docInfo dependencies for a package (no HTML generation).
@@ -321,17 +366,26 @@ library_facet docsHeader (lib) : FilePath := do
 Generate HTML documentation for the given root modules.
 Fetches docInfo for all roots, ensures core docs are built, then runs a single `fromDb` process.
 Returns an array of all generated file paths.
+
+If `prunePrefixes` is non-empty, `fromDb` is told that rows in `api-docs.db` whose module name has
+one of those prefixes "belong" to this build. Any such row not reachable from the configured roots
+is treated as stale (e.g. its source file was deleted) and is removed from the database. Use `#[]`
+to leave the database untouched.
 -/
-def generateHtmlDocs (markerName : String) (rootMods : Array Module) (description : String) : FetchM (Job (Array FilePath)) := do
+def generateHtmlDocs {α} (markerName : String) (rootMods : Array Module)
+    (prunePrefixes : Array Lean.Name) (description : String)
+    (analysisJob : Job α) : FetchM (Job (Array FilePath)) := do
   let exeJob ← «doc-gen4».fetch
   let bibPrepassJob ← bibPrepass.fetch
   let coreJob ← coreDocs.fetch
-  let docInfoJobs := Job.collectArray <| ← rootMods.mapM (fetch <| ·.facet `docInfo)
   let buildDir := (← getRootPackage).buildDir
   let basePath := buildDir / "doc"
   let dbPath := buildDir / "api-docs.db"
   let dataFile := basePath / "declarations" / "declaration-data.bmp"
   let markerFile := buildDir / "doc-data" / s!"{markerName}.docs_built"
+  let pruneArgs : Array String :=
+    if prunePrefixes.isEmpty then #[]
+    else #["--prune-prefix", ",".intercalate (prunePrefixes.toList.map (·.toString))]
   let staticFiles := #[
     basePath / "style.css",
     basePath / "favicon.svg",
@@ -360,14 +414,17 @@ def generateHtmlDocs (markerName : String) (rootMods : Array Module) (descriptio
   let rootNames := rootMods.map (·.name) ++ coreRoots
   let manifestFile := buildDir / "doc-manifest.json"
   coreJob.bindM fun _ => do
-    docInfoJobs.bindM fun _ => do
+    analysisJob.bindM fun _ => do
       bibPrepassJob.bindM fun _ => do
         exeJob.mapM fun exeFile => do
           buildFileUnlessUpToDate' markerFile do
             logInfo description
             proc {
               cmd := exeFile.toString
-              args := #["fromDb", "--build", buildDir.toString, "--manifest", manifestFile.toString, dbPath.toString] ++ rootNames.map (·.toString)
+              args := #["fromDb", "--build", buildDir.toString, "--manifest", manifestFile.toString]
+                ++ pruneArgs
+                ++ #[dbPath.toString]
+                ++ rootNames.map (·.toString)
               env := ← getAugmentedEnv
             }
             createParentDirs markerFile
@@ -385,14 +442,34 @@ def generateHtmlDocs (markerName : String) (rootMods : Array Module) (descriptio
             | .ok (manifestDeps : Array System.FilePath) =>
               return #[dataFile] ++ staticFiles ++ manifestDeps.map (buildDir / ·)
 
+-- Core component names; doubles as a prefix list for pruning toolchain-removed core modules from
+-- the database whenever a `library`/`package` docs build runs.
+private def coreDocPrefixes : Array Lean.Name := #[`Init, `Std, `Lake, `Lean]
+
+/-- Whether to use the single-process batch analyzer (`DOCGEN_BATCH=1`) instead of the per-module
+`docInfo` facet. Batch is much faster for from-scratch builds but re-analyzes a whole library when
+any of its modules change. -/
+private def useBatchAnalysis : FetchM Bool := return (← IO.getEnv "DOCGEN_BATCH").isSome
+
 /-- Generate HTML for this module and its transitive imports. -/
 module_facet docs (mod) : Array FilePath := do
-  generateHtmlDocs s!"{mod.name}--module" #[mod] s!"Generating documentation for {mod.name} and dependencies"
+  -- A single-module target doesn't own a stable namespace, so we don't prune.
+  -- Single-module builds always use the per-module analyzer (there is no library to batch).
+  let analysisJob := Job.collectArray <| ← #[mod].mapM (fetch <| ·.facet `docInfo)
+  generateHtmlDocs s!"{mod.name}--module" #[mod] #[]
+    s!"Generating documentation for {mod.name} and dependencies" analysisJob
 
 /-- Generate HTML for all modules in this library. -/
 library_facet docs (lib) : Array FilePath := do
   let rootMods := lib.rootModules
-  generateHtmlDocs s!"{lib.name}--library" rootMods s!"Generating documentation for {lib.name} ({rootMods.size} root modules)"
+  let prunePrefixes := #[lib.name] ++ coreDocPrefixes
+  let desc := s!"Generating documentation for {lib.name} ({rootMods.size} root modules)"
+  if ← useBatchAnalysis then
+    let analysisJob ← fetch <| lib.facet `docInfoBatch
+    generateHtmlDocs s!"{lib.name}--library" rootMods prunePrefixes desc analysisJob
+  else
+    let analysisJob := Job.collectArray <| ← rootMods.mapM (fetch <| ·.facet `docInfo)
+    generateHtmlDocs s!"{lib.name}--library" rootMods prunePrefixes desc analysisJob
 
 /--
 Generates documentation for the package's default library targets. Runs a single HTML generation
@@ -402,4 +479,11 @@ package_facet docs (pkg) : Array FilePath := do
   let defaultTargets := pkg.defaultTargets
   let libs := pkg.leanLibs.filter fun lib => defaultTargets.contains lib.name
   let rootMods := libs.flatMap (·.rootModules)
-  generateHtmlDocs s!"{pkg.baseName}--package" rootMods s!"Generating documentation for {pkg.baseName} ({rootMods.size} root modules)"
+  let prunePrefixes := libs.map (·.name) ++ coreDocPrefixes
+  let desc := s!"Generating documentation for {pkg.baseName} ({rootMods.size} root modules)"
+  if ← useBatchAnalysis then
+    let analysisJob := Job.collectArray <| ← libs.mapM (fetch <| ·.facet `docInfoBatch)
+    generateHtmlDocs s!"{pkg.baseName}--package" rootMods prunePrefixes desc analysisJob
+  else
+    let analysisJob := Job.collectArray <| ← rootMods.mapM (fetch <| ·.facet `docInfo)
+    generateHtmlDocs s!"{pkg.baseName}--package" rootMods prunePrefixes desc analysisJob

@@ -17,8 +17,11 @@ def envOfImports (imports : Array Name) : IO Environment := do
 /--
 Load a list of modules from the current Lean search path into an `Environment`
 to process for documentation.
+
+When `parallel` is `true`, the per-constant analysis is fanned out across worker threads (see
+`Process.processParallel`); this is used by the batch path that imports a whole library at once.
 -/
-def load (task : Process.AnalyzeTask) : IO Process.AnalyzerResult := do
+def load (task : Process.AnalyzeTask) (parallel : Bool := false) : IO Process.AnalyzerResult := do
   initSearchPath (← findSysroot)
   let env ← envOfImports task.getLoad
   let config := {
@@ -35,6 +38,7 @@ def load (task : Process.AnalyzeTask) : IO Process.AnalyzerResult := do
     fileMap := default,
   }
 
-  Prod.fst <$> Meta.MetaM.toIO (Process.process task) config { env := env } {} {}
+  let analyze := if parallel then Process.processParallel task else Process.process task
+  Prod.fst <$> Meta.MetaM.toIO analyze config { env := env } {} {}
 
 end DocGen4

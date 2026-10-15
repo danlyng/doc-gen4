@@ -487,6 +487,47 @@ def ReadDB.loadLinkingContext (db : ReadDB) : IO LinkingContext := do
 
 end Reading
 
+/--
+Delete modules from the DB whose name has a prefix in `libPrefixes` but is not in the transitive
+import closure of `moduleRoots`. Cascading foreign keys propagate the delete to all dependent
+tables.
+
+This addresses the case where a source file is removed from a project: Lake stops requesting the
+module's `docInfo` facet, so the per-module delete-and-reinsert in `updateModuleDb` never fires for
+it, and its rows would otherwise linger in the database indefinitely. After re-running `single` for
+the modules that still exist, an unreachable stale module is one whose name has a "live" prefix
+(e.g. the library's name, or a core component like `Init`) but is not in the transitive closure of
+the live roots.
+
+Pruning is scoped to `libPrefixes` so that, e.g., `lake build LibA:docs` does not touch rows owned
+by `LibB` in a multi-library workspace. A name `M` has prefix `P` iff `M = P` or `M` starts with
+`P ++ "."`.
+-/
+def pruneStaleModules (dbPath : System.FilePath) (libPrefixes : Array Lean.Name)
+    (moduleRoots : Array Lean.Name) (values : DocstringValues) : IO Unit := do
+  if libPrefixes.isEmpty || moduleRoots.isEmpty then return
+  let roDb ← openForReading dbPath values
+  let reachable : Std.HashSet Lean.Name :=
+    (← roDb.getTransitiveImports moduleRoots).foldl (init := {}) (·.insert ·)
+  let prefixStrings : Array String := libPrefixes.map (·.toString)
+  let inScope (name : String) : Bool :=
+    prefixStrings.any fun p => name == p || name.startsWith s!"{p}."
+  let rwDb ← SQLite.openWith dbPath .readWrite
+  rwDb.busyTimeout 1800000
+  rwDb.exec "PRAGMA foreign_keys = ON"
+  let listStmt ← rwDb.prepare "SELECT name FROM modules"
+  let mut allNames : Array String := #[]
+  while ← listStmt.step do
+    allNames := allNames.push (← listStmt.columnText 0)
+  rwDb.transaction (mode := .immediate) do
+    let deleteStmt ← rwDb.prepare "DELETE FROM modules WHERE name = ?"
+    for name in allNames do
+      if inScope name && !reachable.contains name.toName then
+        deleteStmt.bind 1 name
+        deleteStmt.exec
+        deleteStmt.reset
+        deleteStmt.clearBindings
+
 end DB
 
 open DB
@@ -495,7 +536,7 @@ open DB
 def updateModuleDb (values : DocstringValues)
     (doc : Process.AnalyzerResult)
     (buildDir : System.FilePath) (dbFile : String)
-    (sourceUrl? : Option String) : IO Unit := do
+    (sourceUrlFor : Lean.Name → Option String) : IO Unit := do
   let dbFile := buildDir / dbFile
   DBM.run values dbFile <| withDB fun db => do
     for batch in chunked doc.moduleInfo.toArray 100 do
@@ -511,7 +552,7 @@ def updateModuleDb (values : DocstringValues)
           -- Collect structure field info to save in second pass (after all declarations are in name_info)
           let mut pendingStructureFields : Array (Int64 × Process.StructureInfo) := #[]
           db.deleteModule modNameStr
-          db.saveModule modNameStr sourceUrl?
+          db.saveModule modNameStr (sourceUrlFor modName)
           for imported in modInfo.imports do
             db.saveImport modNameStr imported
           -- Position counter: each item gets a unique sequential position within the module.

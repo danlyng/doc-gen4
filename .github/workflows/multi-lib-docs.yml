@@ -21,3 +21,9 @@ jobs:
 
       - name: Run multi-library docs test
         run: ./test/test-multi-lib-docs.sh
+
+      - name: Run stale-module pruning test
+        run: ./test/test-prune-removed.sh
+
+      - name: Run batch analysis test
+        run: ./test/test-batch-analysis.sh
