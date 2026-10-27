@@ -1,0 +1,142 @@
+name: Sync upstream release tags
+
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+    inputs:
+      resolved_ref:
+        description: 'Optional reviewed refs/heads/sync/vX.Y.Z[-rcN] in this fork'
+        required: false
+        type: string
+      expected_release:
+        description: 'Required after a failure: original upstream TAG@OID from its artifact'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-release-sync
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.repository == 'danlyng/doc-gen4' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      status: ${{ steps.prepare.outputs.status }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Freeze retries after a failed or interrupted observation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_RELEASE: ${{ inputs.expected_release }}
+        run: |
+          gh api 'repos/danlyng/doc-gen4/actions/workflows/upstream-sync.yml/runs?per_page=100' > "$RUNNER_TEMP/sync-history.json"
+          python3 scripts/upstream-sync/sync.py check-history --history "$RUNNER_TEMP/sync-history.json" --expected-release "$EXPECTED_RELEASE"
+      - name: Test controller safeguards
+        run: python3 -m unittest discover -s test/upstream-sync -v
+      - name: Prepare next release
+        id: prepare
+        env:
+          RESOLVED_REF: ${{ inputs.resolved_ref }}
+          EXPECTED_RELEASE: ${{ inputs.expected_release }}
+        run: |
+          args=()
+          if test -n "$RESOLVED_REF"; then args+=(--resolved-ref "$RESOLVED_REF"); fi
+          if test -n "$EXPECTED_RELEASE"; then args+=(--expected-release "$EXPECTED_RELEASE"); fi
+          python3 scripts/upstream-sync/sync.py prepare --output "$RUNNER_TEMP/sync" "${args[@]}"
+      - name: Retain candidate or conflict resolution bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-sync-plan
+          path: |
+            ${{ runner.temp }}/sync/*.json
+            ${{ runner.temp }}/sync/*.bundle
+            ${{ runner.temp }}/sync/*.patch
+            ${{ runner.temp }}/sync/*.txt
+          retention-days: 30
+          if-no-files-found: ignore
+      - name: Report state
+        if: always()
+        run: |
+          echo '### Upstream synchronization' >> "$GITHUB_STEP_SUMMARY"
+          if test -f "$RUNNER_TEMP/sync/plan.json"; then
+            cat "$RUNNER_TEMP/sync/plan.json" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo 'Conflicts require reviewed resolution; see docs/upstream-sync.md.' >> "$GITHUB_STEP_SUMMARY"
+
+  validate:
+    needs: prepare
+    if: needs.prepare.outputs.status == 'candidate'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: upstream-sync-plan
+          path: ${{ runner.temp }}/sync
+      - name: Materialize exact candidate and save trusted gate
+        run: |
+          cp scripts/upstream-sync/validate.sh "$RUNNER_TEMP/validate.sh"
+          git clone "$RUNNER_TEMP/sync/candidate.bundle" "$RUNNER_TEMP/candidate"
+          git -C "$RUNNER_TEMP/candidate" remote set-url origin https://github.com/danlyng/doc-gen4.git
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          p = Path(os.environ['RUNNER_TEMP'])
+          plan = json.loads((p / 'sync/plan.json').read_text())
+          subprocess.run(['git', '-C', str(p / 'candidate'), 'checkout', '--detach', plan['candidate']], check=True)
+          PY
+      - name: Install release toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Clean warnings-as-errors build and all release regressions
+        run: bash "$RUNNER_TEMP/validate.sh" "$RUNNER_TEMP/candidate" "$RUNNER_TEMP/sync/validated.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: upstream-sync-validation
+          path: ${{ runner.temp }}/sync/validated.json
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, validate]
+    if: needs.prepare.outputs.status == 'candidate' && needs.validate.result == 'success'
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: upstream-sync-plan
+          path: ${{ runner.temp }}/sync
+      - uses: actions/download-artifact@v4
+        with:
+          name: upstream-sync-validation
+          path: ${{ runner.temp }}/sync
+      - name: Publish verified fast-forward main and new tag atomically
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Credential helper is limited to this ephemeral publishing job.
+          gh auth setup-git
+          python3 scripts/upstream-sync/sync.py publish --output "$RUNNER_TEMP/sync"
