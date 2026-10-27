@@ -5,9 +5,10 @@
     "upstream_oid": "0656b7ebd305f089c8d6bd8684a0797f19414cc2"
   },
   "last": {
-    "tag": "v4.36.0-rc1",
-    "upstream_commit": "0656b7ebd305f089c8d6bd8684a0797f19414cc2",
-    "upstream_oid": "0656b7ebd305f089c8d6bd8684a0797f19414cc2"
+    "fork_base": "997b1fac63aceec25ab196bae31885f8bc3cebb1",
+    "tag": "v4.36.0-rc2",
+    "upstream_commit": "20afd4ddabd2ef38ffb1a8b930ee0f375e3f75e8",
+    "upstream_oid": "20afd4ddabd2ef38ffb1a8b930ee0f375e3f75e8"
   },
   "schema": 1,
   "upstream_tags": {
@@ -96,6 +97,7 @@
     "v4.35.0-rc3": "20b0edcaf3d2882fe2c906158e79f2f5dbebe57c",
     "v4.35.0-rc4": "fd5ce8f50b90096067f4e5d867611b585e951dbb",
     "v4.36.0-rc1": "0656b7ebd305f089c8d6bd8684a0797f19414cc2",
+    "v4.36.0-rc2": "20afd4ddabd2ef38ffb1a8b930ee0f375e3f75e8",
     "v4.9.0": "1daa0de7eea6bf8d3e1b0814156ede21a8a9e9e9",
     "v4.9.0-rc1": "1cae40a2dd0dca57030385ff53d72c3aa7b27f2b"
   }
