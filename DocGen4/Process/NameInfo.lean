@@ -117,11 +117,48 @@ private def prettyPrintTermStx (stx : Term) (infos : SubExpr.PosMap Elab.Info) :
   }
   return renderTagged (← Widget.tagCodeInfos ctx infos tt)
 
+-- Find implicit arguments that cannot be recovered from the result type or the types of
+-- explicit arguments and instances. Work backwards so that a named argument also determines
+-- its own implicit type parameters, rather than printing those parameters separately.
+private def signatureNamedArgs (e : Expr) : MetaM (Array Nat) := withoutModifyingState <| withNewMCtxDepth do
+  let args := e.getAppArgs
+  let (params, binderInfos, result) ← forallMetaBoundedTelescope (← inferType e.getAppFn) args.size
+  if params.size != args.size then return #[]
+  discard <| isDefEq result (← inferType e)
+  for i in *...args.size do
+    if binderInfos[i]!.isExplicit || binderInfos[i]! == .instImplicit then
+      discard <| isDefEq (← inferType params[i]!) (← inferType args[i]!)
+  let mut needed := #[]
+  for i in (List.range args.size).reverse do
+    if binderInfos[i]! == .implicit || binderInfos[i]! == .strictImplicit then
+      if (← instantiateMVars params[i]!).hasExprMVar then
+        needed := needed.push i
+        discard <| isDefEq (← inferType params[i]!) (← inferType args[i]!)
+        discard <| isDefEq params[i]! args[i]!
+  return needed
+
+open PrettyPrinter.Delaborator SubExpr in
+private def delabSignatureApp : Delab := do
+  let e ← getExpr
+  guard e.getAppFn.isConst
+  let needed ← signatureNamedArgs e
+  guard !needed.isEmpty
+  let mut optionsPerPos := (← read).optionsPerPos
+  for i in needed do
+    let pos ← withNaryArg i getPos
+    let opts := optionsPerPos.get? pos |>.getD {}
+    optionsPerPos := optionsPerPos.insert pos (opts.setBool `pp.analysis.namedArg true)
+  withReader (fun ctx => { ctx with optionsPerPos }) delabApp
+
 def Info.ofTypedName (n : Name) (t : Expr) : MetaM Info := do
+  -- Install the application delaborator only for signatures. Unlike `pp.analyze`, this keeps
+  -- the usual notation and universe/type annotation settings, including in the result type.
+  let env := PrettyPrinter.Delaborator.delabAttribute.ext.addLocalEntry (← getEnv)
+    { key := `app, declName := ``delabSignatureApp, value := delabSignatureApp, isBuiltin := false }
   -- Use the main signature delaborator. We need to run sanitization, parenthesization, and formatting ourselves
   -- to be able to extract the pieces of the signature right before they are formatted
   -- and then format them individually.
-  let (sigStx, infos) ← withTheReader Core.Context ({ · with currNamespace := n.getPrefix }) <|
+  let (sigStx, infos) ← withEnv env <| withTheReader Core.Context ({ · with currNamespace := n.getPrefix }) <|
     PrettyPrinter.delabCore t (delab := PrettyPrinter.Delaborator.delabForallParamsWithSignature fun binders type =>
       -- Use `declSig` as a data structure so that the binders and type can be put through the sanitizer all together.
       `(declSig| $binders* : $type))
