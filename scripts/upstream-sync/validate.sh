@@ -14,6 +14,7 @@ if [[ -d .lake/packages ]]; then
   find .lake/packages -type d -path '*/.lake/build' -prune -exec rm -rf '{}' +
 fi
 lake build --wfail
+bash test/test-src-uri.sh
 ./test/test-multi-lib-docs.sh
 DOCGEN_BATCH=1 DOCGEN_NUM_THREADS=2 ./test/test-multi-lib-docs.sh
 ./test/test-prune-removed.sh
